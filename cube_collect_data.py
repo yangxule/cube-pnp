@@ -266,8 +266,12 @@ class CubePickPlaceFSM:
         return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gripper], dtype=np.float32)
 
     # ----------------------------------------------------------------- public
-    def begin_episode(self):
-        """环境 reset 且立方体落稳后调用。"""
+    def begin_episode(self, already_held: bool = False):
+        """环境 reset 且立方体落稳后调用。
+
+        already_held=True 用于 DAgger 接管：立方体已在夹爪中，跳过抓取阶段，
+        从当前状态直接进入 TRANSPORT 完成放置。
+        """
         self.state = State.INIT
         self.ticks_in_state = 0
         self.failed_reason = None
@@ -276,6 +280,19 @@ class CubePickPlaceFSM:
         self.grip_close = None
         self.grasped_flag = False
         self._cube_z_hist = []
+
+        if already_held:
+            cube = self._cube_xyz()
+            plate = self._plate_xyz()
+            self.cube0 = cube.copy()
+            self.place_xyz = np.array(
+                [plate[0], plate[1], self._plate_top_z() + self.place_dz])
+            # 抬到当前夹持高度上方 10cm（不超过 0.98，避免超出工作空间）
+            self.lift_z = min(cube[2] + 0.10, 0.98)
+            self.grip_cmd = 0.65
+            self.grip_close = 0.65
+            self.grasped_flag = True
+            self._transition(State.TRANSPORT)
 
     def step(self):
         """返回 (action, finished)；finished 时状态为 DONE 或 FAIL。"""

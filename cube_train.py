@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""在 cube 演示数据集上训练 ACT 策略（含 episode 级验证集）。
+"""在 cube 演示数据集上训练 ACT 策略（含 episode 级验证集，支持微调续训）。
 
 迁移自根目录 3.train.py，改动：
   1. 数据集/仓库名/输出目录指向 cube_pnp（./demo_data, ./ckpt/act_cube）。
@@ -7,9 +7,26 @@
      输出 train/val loss，便于监控过拟合。
   3. 训练结束做 checkpoint 保存与重新加载校验，并在一集上打印预测动作
      与 GT 的平均误差。
+  4. 支持 --init_from 微调：从已有 checkpoint 加载权重，在合并数据集
+     （如 DAgger 接管数据追加后）上用小学习率短步数续训，避免全量重训。
 
 Usage:
-    python cube_train.py                          # 1500 steps, GPU, 10% val
+    # ---- 从零训练（默认双相机：agentview + wrist）----
+    python cube_train.py --steps 4000 --ckpt ./ckpt/act_cube_wrist
+
+    # ---- 微调续训（DAgger 数据追加后推荐）----
+    # 从旧 checkpoint 加载权重，小学习率（约 5e-5）短训 1000-1500 步；
+    # 归一化统计自动使用当前 --root 数据集的统计值。
+    # 注意：--init_from 的相机配置必须与本次训练输入一致：
+    #   双视角 ckpt（act_cube_wrist）-> 不加 --no_wrist
+    #   单视角 ckpt（act_cube）       -> 必须加 --no_wrist
+    python cube_train.py --init_from ./ckpt/act_cube_wrist \
+        --ckpt ./ckpt/act_cube_dagger --steps 1500 --lr 5e-5
+    python cube_train.py --init_from ./ckpt/act_cube --no_wrist \
+        --ckpt ./ckpt/act_cube_ft --steps 1500 --lr 5e-5
+
+    # ---- 其他 ----
+    python cube_train.py --no_wrist               # 退回单视角（仅 agentview）
     python cube_train.py --steps 200 --no-cuda    # CPU sanity check
 """
 import os
@@ -111,6 +128,11 @@ def main():
     parser.add_argument("--val_freq", type=int, default=500)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no_wrist", action="store_true",
+                        help="退回单视角（仅 agentview）；默认使用双相机")
+    parser.add_argument("--init_from", type=str, default=None,
+                        help="已有 checkpoint 路径，加载其权重作为初始化；"
+                             "省略则从零训练。注意与 --no_wrist 的相机配置必须一致")
     parser.add_argument("--no-cuda", action="store_true")
     args = parser.parse_args()
 
@@ -133,8 +155,13 @@ def main():
                        if ft.type is FeatureType.ACTION}
     input_features = {k: ft for k, ft in features.items()
                       if k not in output_features}
-    # 与原脚本一致：仅用 agentview 主视角，不用 wrist 视角
-    input_features.pop("observation.wrist_image", None)
+    # 双视角：agentview 主相机 + wrist 腕部相机（wrist 近距离观察夹爪-立方体，
+    # 为闭合时机提供毫米级视觉信息）
+    if args.no_wrist:
+        input_features.pop("observation.wrist_image", None)
+        print("input: agentview only (--no_wrist)")
+    else:
+        print("input: agentview + wrist dual cameras")
 
     cfg = ACTConfig(input_features=input_features,
                     output_features=output_features,
@@ -162,7 +189,23 @@ def main():
     print(f"train frames={len(train_sampler)} val frames={len(val_sampler)}")
 
     # ---------------------------------------------------------------- model
-    policy = ACTPolicy(cfg, dataset_stats=dataset_metadata.stats)
+    if args.init_from:
+        # 微调：加载已有 checkpoint 权重；相机输入配置必须与之一致
+        import json
+        with open(Path(args.init_from) / "config.json") as f:
+            init_inputs = set(json.load(f)["input_features"].keys())
+        if init_inputs != set(input_features.keys()):
+            raise SystemExit(
+                f"--init_from 的相机配置 {sorted(init_inputs)} 与本次训练输入 "
+                f"{sorted(input_features.keys())} 不一致；"
+                f"单视角 ckpt 请加 --no_wrist，双视角 ckpt 请去掉 --no_wrist")
+        policy = ACTPolicy.from_pretrained(
+            args.init_from, config=cfg,
+            dataset_stats=dataset_metadata.stats)  # 归一化统计用当前数据集
+        print(f"finetune: init from {args.init_from} (lr={args.lr})")
+    else:
+        policy = ACTPolicy(cfg, dataset_stats=dataset_metadata.stats)
+        print("train from scratch")
     policy.train()
     policy.to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)

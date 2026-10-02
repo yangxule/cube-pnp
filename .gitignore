@@ -1,5 +1,4 @@
-# 模型资产、数据集、checkpoint 不纳入版本管理（V1.0.0 仅提交代码）
-/asset/
+# 数据集、checkpoint 不纳入版本管理（体积大，需本地生成）
 /demo_data/
 /ckpt/
 __pycache__/
